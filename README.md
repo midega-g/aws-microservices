@@ -16,7 +16,7 @@ Future iterations will refactor this architecture to incorporate a Service Mesh 
 
 ## Getting Started
 
-#### Prerequisites
+### Prerequisites
 
 1. [AWS Account](https://aws.amazon.com/)
 2. [HashiCorp Terraform](https://www.terraform.io/downloads) installed
@@ -24,7 +24,7 @@ Future iterations will refactor this architecture to incorporate a Service Mesh 
 4. [AWS IAM User](https://docs.aws.amazon.com/IAM/latest/UserGuide/getting-started_create-admin-group.html) with Admin or Power User permissions
 5. [Configure AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/cli-chap-configure.html) with your IAM credentials
 
-#### Using this Code
+### Using this Code
 
 1. Clone this repository
 2. Run `terraform init` to initialize the project
@@ -32,19 +32,13 @@ Future iterations will refactor this architecture to incorporate a Service Mesh 
 4. Run `terraform apply` to create the AWS infrastructure
 5. Run `terraform destroy` to clean up resources when finished
 
-## Additional Tools
-
-This repository also includes:
-
-- **YouTube Transcript Downloader** (`yttdownloader.py`) - A CLI tool for fetching YouTube video transcripts using the YouTube Transcript API
-
 ## Project Structure
 
-- `vpc.tf` - Virtual Private Cloud configuration
-- `variables.tf` - Input variables and configuration
-- `main.tf` - Provider configuration and main setup
-- `notes/` - Detailed learning notes and documentation
-- `images/` - Architecture diagrams and visual references
+- [`vpc.tf`](./vpc.tf) - Virtual Private Cloud configuration
+- [`variables.tf`](./variables.tf) - Input variables and configuration
+- [`main.tf`](./main.tf) - Provider configuration and main setup
+- [`notes/`](./notes/) - Detailed learning notes and documentation
+- [`images/`](./images/) - Architecture diagrams and visual references
 
 ## Learning Resources
 
