@@ -361,3 +361,257 @@ resource "aws_internet_gateway" "main" {
 **Terraform Dependency Management**
 
 Terraform automatically manages resource dependencies, creating resources in the correct order based on references (e.g., `aws_vpc.main.id`). Explicit dependency control is possible using the `depends_on` attribute, covered in later sections.
+
+## Scaling Subnets for Microservices
+
+To support a microservices architecture, a VPC needs multiple subnets to distribute workloads across availability zones (AZs) for resilience and scalability. This section explores how to efficiently create multiple public and private subnets, ensuring no overlap in IP ranges and proper routing for internet access.
+
+### Why Multiple Subnets?
+
+Microservices often require separation between public-facing components (e.g., API gateways, load balancers) and private components (e.g., databases, backend services). Public subnets allow direct internet access, while private subnets enhance security by restricting inbound traffic. Spreading subnets across AZs ensures high availability, as a failure in one zone doesn’t disrupt the entire application. Before scaling, it’s critical to validate a single-subnet configuration to ensure the VPC, route tables, and internet gateways function correctly.
+
+### Single Subnet as a Foundation
+
+Before introducing dynamic replication, consider a single public subnet. This establishes the baseline configuration, including CIDR block allocation and route table association. For example:
+
+```py
+# File: vpc.tf (single subnet example)
+
+resource "aws_subnet" "public" {
+  vpc_id                          = aws_vpc.main.id
+  cidr_block                      = cidrsubnet(aws_vpc.main.cidr_block, 4, 0) 
+  ipv6_cidr_block                 = cidrsubnet(aws_vpc.main.ipv6_cidr_block, 8, 0)
+  map_public_ip_on_launch         = true
+  assign_ipv6_address_on_creation = true
+  availability_zone               = data.aws_availability_zones.available.names[0]
+  tags = {
+    Name = "${var.default_tags.project}-public-${
+    data.aws_availability_zones.available.names[0]}"
+  }
+}
+```
+
+Here, the `cidrsubnet` function calculates a subnet range from the VPC’s CIDR (e.g., 10.255.0.0/20). It takes three arguments:
+
+- **prefix**: The VPC’s CIDR block (e.g., 10.255.0.0/20).
+- **newbits**: Additional bits for the subnet mask (e.g., 4 extends /20 to /24, yielding 256 addresses per subnet).
+- **netnum**: The subnet number (e.g., 0 for the first subnet).
+
+The function shifts the base address to create non-overlapping ranges (e.g., 10.255.0.0/24 for netnum=0, 10.255.1.0/24 for netnum=1). `map_public_ip_on_launch` assigns public IPs to resources, enabling internet access.
+
+### Introducing the `count` Meta-Argument
+
+Manually duplicating subnet resources for each AZ is verbose and error-prone. Terraform’s `count` meta-argument allows creating multiple instances of a resource dynamically. It’s a top-level attribute applied to any resource, specifying how many copies to create. The `count.index` variable (starting at 0) differentiates each instance, enabling unique configurations like CIDR blocks and AZ assignments.
+
+#### Prerequisites for Using `count`
+
+Before applying `count`, ensure the single-subnet configuration works (`terraform apply` succeeds). This confirms the VPC, data sources (e.g., availability zones), and dependencies are correct. Define a variable to control the number of subnets, making the configuration reusable.
+
+```py
+# File: variables.tf
+
+variable "public_subnet_count" {
+  type        = number
+  description = "Number of public subnets to create"
+  default     = 2
+}
+```
+
+#### Applying `count` to Public Subnets
+
+Update the public subnet resource to use `count`, varying CIDR blocks and AZs with `count.index`. This spreads subnets across AZs for fault tolerance.
+
+```py
+# File: vpc.tf
+
+resource "aws_subnet" "public" {
+  count                           = var.public_subnet_count
+  vpc_id                          = aws_vpc.main.id
+  cidr_block          = cidrsubnet(aws_vpc.main.cidr_block, 4, count.index)
+  ipv6_cidr_block     = cidrsubnet(aws_vpc.main.ipv6_cidr_block, 8, count.index)
+  map_public_ip_on_launch         = true
+  assign_ipv6_address_on_creation = true
+  availability_zone   = data.aws_availability_zones.available.names[count.index]
+  tags = {
+    Name = "${var.default_tags.project}-public-${
+    data.aws_availability_zones.available.names[count.index]}"
+  }
+}
+```
+
+Here, `count.index` replaces the fixed `0` in `cidrsubnet` and `availability_zone`, creating subnets like 10.255.0.0/24 (index=0) and 10.255.1.0/24 (index=1), each in a different AZ. However, the tag’s `names[0]` is incorrect—it should use `count.index` to reflect the correct AZ:
+
+```py
+tags = {
+  Name = "${var.default_tags.project}-public-${
+  data.aws_availability_zones.available.names[count.index]}"
+}
+```
+
+#### Dynamic Route Table Associations
+
+Each subnet needs a route table association. Using `count` here ensures each subnet links to the public route table. The challenge is referencing individual subnet IDs from the list of public subnets created with `count`.
+
+##### The Splat Operator and `element` Function
+
+The splat operator (`*`) accesses all instances of a resource’s attribute as a list (e.g., `aws_subnet.public.*.id` returns a list of all public subnet IDs). Since `subnet_id` expects a single ID, the `element` function selects one item: `element(list, index)`. It wraps around if the index exceeds the list length, but care is needed to avoid exceeding available AZs (e.g., us-east-1 typically has 6 AZs).
+
+```py
+# File: vpc.tf
+
+resource "aws_route_table_association" "public" {
+  count          = var.public_subnet_count
+  subnet_id      = element(aws_subnet.public.*.id, count.index)
+  route_table_id = aws_route_table.public.id
+}
+```
+
+This creates one association per subnet, matching each subnet’s ID to the route table.
+
+## Configuring Private Subnets
+
+Private subnets host sensitive microservices, like backend APIs or databases, without direct internet exposure. They differ from public subnets in key ways:
+
+- **No Public IPs**: Omit `map_public_ip_on_launch` and `assign_ipv6_address_on_creation` to prevent external access, enhancing security.
+- **CIDR Offset**: Avoid overlap with public subnets by offsetting the `netnum` in `cidrsubnet`.
+
+### Variable for Private Subnets
+
+Define a variable to control the number of private subnets.
+
+```py
+# File: variables.tf
+
+variable "private_subnet_count" {
+  type        = number
+  description = "Number of private subnets to create"
+  default     = 2
+}
+```
+
+### Private Subnet Configuration
+
+Offset the CIDR block by the number of public subnets to ensure unique ranges. For example, if public subnets use 10.255.0.0/24 and 10.255.1.0/24, private subnets start at 10.255.2.0/24.
+
+```py
+# File: vpc.tf
+
+resource "aws_subnet" "private" {
+  count             = var.private_subnet_count
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = cidrsubnet(aws_vpc.main.cidr_block, 4, 
+                                count.index + var.public_subnet_count)
+  availability_zone = data.aws_availability_zones.available.names[count.index]
+  tags = {
+    Name = "${var.default_tags.project}-private-${
+    data.aws_availability_zones.available.names[count.index]}"
+  }
+}
+```
+
+The `count.index + var.public_subnet_count` ensures the first private subnet starts after the last public subnet (e.g., index=0 + public_subnet_count=2 gives netnum=2, yielding 10.255.2.0/24). The tag should also use `count.index` for correct AZ naming, correcting the provided code’s error.
+
+### Why Offset CIDR Blocks?
+
+Without offsetting, private subnets would attempt to reuse public subnet CIDR ranges, causing conflicts (e.g., both trying to use 10.255.0.0/24). Using `var.public_subnet_count` ensures that even if public and private subnet counts differ (e.g., 3 public, 1 private), the private subnet starts at 10.255.3.0/24, avoiding overlap.
+
+### Enabling Internet Access for Private Subnets
+
+Private subnets need outbound internet access for tasks like software updates, achieved via a NAT gateway in a public subnet, which requires an Elastic IP (EIP).
+
+#### Elastic IP (EIP)
+
+An EIP is a static public IP address, necessary for the NAT gateway to maintain a consistent external address.
+
+```py
+# File: vpc.tf
+
+resource "aws_eip" "nat" {
+  domain = "vpc"
+  tags = {
+    Name = "${var.default_tags.project}-nat-eip"
+  }
+}
+```
+
+The `domain = "vpc"` ties the EIP to the VPC, ensuring it’s usable for networking resources like NAT gateways.
+
+#### NAT Gateway
+
+The NAT gateway translates private subnet traffic to the public internet, residing in a public subnet to access the internet gateway. It’s single-AZ by default, so for high availability, create one per AZ (not covered here but noted for scalability).
+
+```py
+# File: vpc.tf
+
+resource "aws_nat_gateway" "nat" {
+  allocation_id = aws_eip.nat.id
+  subnet_id     = aws_subnet.public[0].id  # First public subnet
+  tags = {
+    Name = "${var.default_tags.project}-nat-gateway"
+  }
+  depends_on = [aws_eip.nat, aws_internet_gateway.gw]
+}
+```
+
+The `subnet_id` uses array notation (`[0]`) instead of the splat operator to select the first public subnet explicitly, as only one NAT gateway is created here.
+
+**Explicit Dependencies with `depends_on`**
+
+Terraform infers dependencies from references (e.g., `aws_eip.nat.id`), but `depends_on` ensures the EIP and internet gateway exist before the NAT gateway. This prevents race conditions, especially since NAT gateways rely on both resources.
+
+```py
+depends_on = [aws_eip.nat, aws_internet_gateway.gw]
+```
+
+### Private Route Table and Routing
+
+Direct private subnet traffic to the NAT gateway for outbound access.
+
+```py
+# File: vpc.tf
+
+resource "aws_route_table" "private" {
+  vpc_id = aws_vpc.main.id
+  tags = {
+    Name = "${var.default_tags.project}-private-route-table"
+  }
+}
+
+resource "aws_route" "private_nat_access" {
+  route_table_id         = aws_route_table.private.id
+  destination_cidr_block = "0.0.0.0/0"
+  nat_gateway_id         = aws_nat_gateway.nat.id
+}
+
+resource "aws_route_table_association" "private" {
+  count          = var.private_subnet_count
+  subnet_id      = element(aws_subnet.private.*.id, count.index)
+  route_table_id = aws_route_table.private.id
+}
+```
+
+The route uses `nat_gateway_id` instead of `gateway_id` (used for internet gateways), directing all outbound traffic (`0.0.0.0/0`) to the NAT gateway. The association uses `count` and `element` to link each private subnet to the route table.
+
+## Terraform Workflow Enhancements
+
+### Code Formatting
+
+The `terraform fmt` command aligns code (e.g., equal signs, spacing) for readability, making it easier to scan large configurations.
+
+### Visualizing Resource Relationships
+
+The `terraform graph` command outputs a dependency graph, convertible to a PNG for visual analysis.
+
+```bash
+terraform graph -type=plan | dot -Tpng >images/vpc-configurations.png
+```
+
+This visualizes how resources like subnets, route tables, and gateways interrelate (as shown below), aiding debugging and planning.
+
+![vpc-configuration](../images/vpc-configurations.png)
+
+### Cleaning Up Resources
+
+To avoid costs, destroy resources when not needed using `terraform destroy`. Since the configuration is in code, resources can be recreated identically later.
+
+This setup provides a robust VPC foundation for microservices, with public subnets for accessible components and private subnets for secure ones, all scalable and manageable through Terraform’s declarative approach.
