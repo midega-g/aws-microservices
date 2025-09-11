@@ -6,7 +6,7 @@ resource "aws_vpc" "main" {
   enable_dns_support               = true
   assign_generated_ipv6_cidr_block = true
   tags = {
-    "Name" = "${var.default_tags.project}-VPC"
+    "Name" = "${var.default_tags.project}-vpc"
   }
 }
 
@@ -83,7 +83,7 @@ resource "aws_nat_gateway" "nat" {
   tags = {
     "Name" = "${var.default_tags.project}-nat-gateway"
   }
-  # adding an explicit depency on the igw for the vpc
+  # adding an explicit dependency on the igw for the vpc
   # to ensure proper ordering
   depends_on = [aws_eip.nat, aws_internet_gateway.gw]
 }
