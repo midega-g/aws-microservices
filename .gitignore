@@ -7,3 +7,4 @@ terraform.tfvars
 .DS_Store
 
 *.txt
+scrible.md
