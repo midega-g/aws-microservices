@@ -1,6 +1,6 @@
 # Extending Your Application with Private Microservices
 
-The first part of episode 3 the focuses on extending the microservices architecture by adding a private `fruits` service to the existing setup, which already includes a public `client` service running on Amazon ECS with Fargate. The emphasis is on creating private services accessible only within the VPC, integrating them with the `client` service, and setting the stage for future service mesh adoption. The notes explain the configuration of ECS task definitions, services, load balancers, and security groups, detailing why private services differ from public ones, how to manage internal traffic, and the importance of Terraform state management. The approach builds from the `client` service, reusing patterns to minimize redundancy while introducing new concepts like internal load balancers and environment variable configurations for service communication.
+The first part of episode 3 focuses on extending the microservices architecture by adding a private `fruits` service to the existing setup, which already includes a public `client` service running on Amazon ECS with Fargate. The emphasis is on creating private services accessible only within the VPC, integrating them with the `client` service, and setting the stage for future service mesh adoption. The notes explain the configuration of ECS task definitions, services, load balancers, and security groups, detailing why private services differ from public ones, how to manage internal traffic, and the importance of Terraform state management. The approach builds from the `client` service, reusing patterns to minimize redundancy while introducing new concepts like internal load balancers and environment variable configurations for service communication.
 
 ## Recap of the Existing Architecture
 
@@ -587,3 +587,302 @@ To understand how ECS and the load balancer handle failures, you can simulate an
 ![cl-fr-vg-response-down](../images/cl-fr-vg-response-down.png)
 
 **Tip:** You can also watch the ECS events and ALB target group health status to see the failover and recovery process in real time.
+
+## Integrating a Database with Microservices
+
+This section concludes the non-mesh microservices architecture by integrating a simulated database running on an EC2 instance, contrasting with the containerized services on Fargate. It explores why EC2 is chosen for this component, how to dynamically select AMIs using SSM Parameter Store, and configuring user data scripts for automated setup. The narrative builds from the existing fruits and vegetables services, updating them to connect to the database, and introduces security configurations for controlled access. Explanations delve into the differences between EC2 and Fargate, the role of user data in provisioning, and why private IPs and key pairs are essential. Finally, it teases the transition to a service mesh to address scaling challenges like operational overhead and service discovery.
+
+### A Database hosted on EC2
+
+To complete the architecture, add a backend database that the fruits and vegetables services query. Unlike prior services on Fargate, host this on EC2 for variety, simulating a non-containerized component (e.g., a legacy database). This demonstrates hybrid setups where not everything is containerized, setting up for service mesh discussions where unified communication is key.
+
+### Why EC2 for the Database?
+
+Fargate abstracts servers, ideal for stateless microservices, but EC2 offers direct control for stateful components like databases requiring persistent storage or custom OS tweaks. Here, use EC2 to run a fake-service as a "database" on a VM, highlighting differences: EC2 needs AMI selection, instance types, and SSH access via key pairs, unlike Fargate's serverless model. This choice illustrates real-world migrations where databases lag containerization.
+
+### Prerequisites for EC2 Setup
+
+Before configuring, ensure the VPC, subnets, and prior services (client, fruits, vegetables) are applied. Create an EC2 key pair in the AWS console for SSH (not automated here for security). Define variables for the database's private IP, key pair, name, and message to make the setup reusable.
+
+```py
+# File: variables.tf (excerpt)
+
+variable "database_private_ip" {
+  type        = string
+  description = "Private ip address of database"
+}
+
+variable "ec2_key_pair" {
+  type        = string
+  description = "EC2 key pair"
+}
+
+variable "database_service_name" {
+  type        = string
+  description = "Database service name"
+  default     = "database"
+}
+
+variable "database_message" {
+  type        = string
+  description = "Database message"
+  default     = "Hello from the database"
+}
+```
+
+**Why These Variables?**
+
+- **Private IP**: Ensures a static address for reliable internal routing, avoiding DNS resolution overhead.
+- **Key Pair**: Enables SSH for debugging or manual interventions, critical for EC2 but absent in Fargate.
+- **Defaults**: Provide fallback values for the fake-service, customizable for real databases.
+
+### Configuring Terraform Variables
+
+We'll also have to configure Terraform variables in `terraform.tfvars` for the EC2 key pair and the database private IP address. These variables provide reusable, environment-specific values, reducing hardcoding and enabling easy adjustments across deployments.
+
+```hcl
+# File: terraform.tfvars
+
+ec2_key_pair        = "learn-live-with-aws-and-hashicorp"
+database_private_ip = "10.255.2.253"
+```
+
+**Why These Variables?**
+
+- **ec2_key_pair**: Specifies an SSH key pair for the EC2 instance, enabling secure access for debugging or maintenance. The value `"learn-live-with-aws-and-hashicorp"` must match a key pair created in the AWS console, ensuring SSH connectivity if needed. This is critical for EC2 (unlike Fargate) to manage the VM directly, especially for troubleshooting a non-containerized database.
+- **database_private_ip**: Sets a static private IP (`10.255.2.253`) within the VPC’s private subnet range for the EC2 instance. A fixed IP ensures consistent addressing for fruits and vegetables services to reach the database without DNS resolution, simplifying configuration and reducing latency. Note that the IP is chosen from the console to avoid conflicts within the subnet (e.g., `10.255.2.0/24`).
+
+## Dynamically Selecting an AMI with SSM Parameter Store
+
+AMIs (Amazon Machine Images) define the OS and software for EC2 instances. Hardcoding AMI IDs risks obsolescence; instead, query AWS Systems Manager (SSM) Parameter Store for the latest version dynamically.
+
+### Understanding SSM Parameter Store
+
+SSM Parameter Store holds configuration data as parameters, including public ones from AWS for latest AMIs (e.g., Ubuntu versions). It's secure, versioned, and integrates with Terraform via data sources, avoiding manual updates.
+
+### Querying the Latest AMI
+
+Use a data source to fetch the Ubuntu 18.04 AMI ID from SSM, ensuring the instance uses a current, patched image.
+
+```py
+# File: ec2.tf (excerpt)
+
+data "aws_ssm_parameter" "ubuntu1804" {
+  name = <<EOT
+/aws/service/canonical/ubuntu/server/18.04/stable/current/amd64/hvm/ebs-gp2/ami-id
+EOT
+}
+```
+
+**Why SSM Over Hardcoding?**
+SSM returns the latest AMI ID automatically, promoting security and reducing maintenance. The path targets a specific Ubuntu variant (18.04 LTS, AMD64, HVM, EBS-GP2), but alternatives exist for [other distributions or versions](https://docs.aws.amazon.com/systems-manager/latest/userguide/parameter-store-public-parameters-ami.html).
+
+## Configuring the EC2 Instance
+
+The EC2 instance resource provisions the VM in a private subnet, attaching security groups and a key pair. User data scripts automate setup, installing and running the fake-service as a systemd service.
+
+### Building the Instance Configuration
+
+Start with basics: AMI from SSM, instance type for cost/performance, subnet for privacy, and tags for organization. Add private IP and key pair for access.
+
+```py
+# File: ec2.tf
+
+resource "aws_instance" "database" {
+  ami                    = data.aws_ssm_parameter.ubuntu1804.value
+  instance_type          = "t3.micro"
+  subnet_id              = aws_subnet.private[0].id
+  vpc_security_group_ids = [aws_security_group.database.id]
+  private_ip             = var.database_private_ip
+  key_name               = var.ec2_key_pair
+  tags                   = { "Name" = "${var.default_tags.project}-database" }
+
+  user_data = base64encode(templatefile("${path.module}/scripts/database.sh", {
+    DATABASE_SERVICE_NAME = var.database_service_name
+    DATABASE_MESSAGE      = var.database_message
+  }))
+}
+```
+
+**Why These Settings?**
+
+- **t3.micro**: Balances cost (free-tier eligible) and performance for a simple fake database; upgrade for real workloads.
+- **Private Subnet**: Isolates the database, accessible only via internal services.
+- **Security Group**: Custom rules (defined below) restrict access to fruits/vegetables services.
+- **Private IP and Key Pair**: Static IP for consistent URIs; key pair for SSH troubleshooting.
+
+### Automating Setup with User Data
+
+User data runs a Bash script on boot, installing fake-service and configuring it as a systemd service. Encode and template it for variable injection.
+
+```bash
+# File: scripts/database.sh
+
+#!/bin/bash
+
+apt update && apt install -y unzip
+
+# Install Fake Service
+curl -LO https://github.com/nicholasjackson/fake-service/releases/download/v0.23.1/fake_service_linux_amd64.zip
+unzip fake_service_linux_amd64.zip
+mv fake-service /usr/local/bin
+chmod +x /usr/local/bin/fake-service
+
+# Fake Service Systemd Unit File
+cat > /etc/systemd/system/database.service <<- EOF
+[Unit]
+Description=Database
+After=syslog.target network.target
+[Service]
+Environment="MESSAGE='${DATABASE_MESSAGE}'"
+Environment="NAME=${DATABASE_SERVICE_NAME}"
+Environment="LISTEN_ADDR=0.0.0.0:27017"
+ExecStart=/usr/local/bin/fake-service
+ExecStop=/bin/sleep 5
+Restart=always
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Reload unit files and start the database service
+systemctl daemon-reload
+systemctl start database
+```
+
+**Why User Data?**
+It automates provisioning without manual SSH, running as root on first boot. The script installs dependencies, downloads fake-service, and sets up a systemd unit for persistence and restarts. Port 27017 mimics MongoDB, with environment variables customizing the response.
+
+**Templating with base64encode**: Injects variables (e.g., message) and encodes for AWS transmission, ensuring the script executes correctly.
+
+## Updating Services to Connect to the Database
+
+Modify fruits and vegetables task definitions to call the database via its private IP, simulating data queries.
+
+### Fruits Task Update
+
+Add `UPSTREAM_URIS` pointing to the database.
+
+```py
+# File: ecs-task-definition.tf (excerpt)
+
+resource "aws_ecs_task_definition" "fruits" {
+  # ... (prior config)
+
+  container_definitions = jsonencode([
+    {
+      # ... (prior config)
+
+      environment = [
+        # ... (prior vars)
+        {
+          name  = "UPSTREAM_URIS"
+          value = "http://${var.database_private_ip}:27017"
+        }
+      ]
+    }
+  ])
+}
+```
+
+### Vegetables Task Update
+
+Similarly, add the upstream URI.
+
+```py
+# File: ecs-task-definition.tf
+
+resource "aws_ecs_task_definition" "vegetables" {
+  family                   = "${var.default_tags.project}-vegetables"
+  requires_compatibilities = ["FARGATE"]
+  memory                   = 512
+  cpu                      = 256
+  network_mode             = "awsvpc"
+
+  container_definitions = jsonencode([
+    {
+      # ... (similar to fruits, omitted for brevity)
+
+      environment = [
+        # ... (prior vars)
+        {
+          name  = "UPSTREAM_URIS"
+          value = "http://${var.database_private_ip}:27017"
+        }
+      ]
+    }
+  ])
+}
+```
+
+**Why Update Tasks?**
+`UPSTREAM_URIS` configures fake-service to forward requests to the database, enabling chained calls (client → fruits/vegetables → database). The private IP ensures direct, secure internal routing without DNS.
+
+## Securing the Database
+
+A dedicated security group restricts access to the database, allowing only fruits and vegetables services.
+
+### Database Security Group
+
+Permit inbound on port 27017 from specific service groups and allow all outbound.
+
+```py
+# File: security-groups.tf
+
+resource "aws_security_group" "database" {
+  name_prefix = "${var.default_tags.project}-database"
+  description = "Database security group."
+  vpc_id      = aws_vpc.main.id
+}
+
+resource "aws_security_group_rule" "database_allow_fruits_27017" {
+  security_group_id        = aws_security_group.database.id
+  type                     = "ingress"
+  protocol                 = "tcp"
+  from_port                = 27017
+  to_port                  = 27017
+  source_security_group_id = aws_security_group.ecs_fruits_service.id
+  description              = "Allow incoming traffic from the Fruits service onto the database port."
+}
+
+resource "aws_security_group_rule" "database_allow_vegetables_27017" {
+  security_group_id        = aws_security_group.database.id
+  type                     = "ingress"
+  protocol                 = "tcp"
+  from_port                = 27017
+  to_port                  = 27017
+  source_security_group_id = aws_security_group.ecs_vegetables_service.id
+  description              = "Allow incoming traffic from the Vegetables service onto the database port."
+}
+
+resource "aws_security_group_rule" "database_allow_outbound" {
+  security_group_id = aws_security_group.database.id
+  type              = "egress"
+  protocol          = "-1"
+  from_port         = 0
+  to_port           = 0
+  cidr_blocks       = ["0.0.0.0/0"]
+  ipv6_cidr_blocks  = ["::/0"]
+  description       = "Allow any outbound traffic."
+}
+```
+
+**Why Source Security Groups?**
+Referencing service groups (`source_security_group_id`) ensures only authorized ECS tasks access the database, enforcing least privilege. Outbound allows updates or external calls if needed.
+
+## Validating and Testing
+
+After `terraform apply`, the client ALB should chain responses through fruits/vegetables to the database ("Hello from the database") as show below:
+
+![full-microservice](../images/full-microservice.png)
+
+If tasks restart, allow drainage time. The database's private nature confirms no external access.
+
+## Challenges with the Current Architecture and Path to Service Mesh
+
+As services grow, issues emerge:
+
+- **File Management**: Repetitive code across files increases maintenance.
+- **Operational Overhead**: Manual updates (e.g., URIs) for new services introduce errors and ticket workflows.
+- **Developer Experience**: Large files hinder focus; independent releases are possible but communication is manual.
+
+A service mesh (e.g., HashiCorp Consul) addresses these by centralizing discovery, reducing load balancers, and automating connectivity, eliminating manual URIs and enhancing observability. Future chapters will implement this for scalable, resilient microservices.
